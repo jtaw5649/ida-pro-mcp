@@ -230,6 +230,23 @@ class StackVarDelete(TypedDict):
     name: Annotated[str, "Variable name"]
 
 
+class DefineOp(TypedDict, total=False):
+    """Define function/code operation"""
+
+    addr: Annotated[
+        str, "Address to define (hex or decimal). Use 'start:end' for explicit bounds."
+    ]
+    end: Annotated[str, "Optional end address for explicit bounds"]
+
+
+class UndefineOp(TypedDict, total=False):
+    """Undefine operation"""
+
+    addr: Annotated[str, "Address to undefine (hex or decimal)"]
+    end: Annotated[str, "Optional end address"]
+    size: Annotated[int, "Optional size in bytes"]
+
+
 # ============================================================================
 # TypedDict Definitions for Results
 # ============================================================================
