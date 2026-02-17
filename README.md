@@ -182,6 +182,9 @@ Queue wait timeout auto-scales with queue depth (`IDA_MCP_QUEUE_AUTOSCALE=1` by 
 Use `IDA_MCP_QUEUE_AUTOSCALE_HEADROOM_SECONDS` and `IDA_MCP_QUEUE_AUTOSCALE_MAX_SECONDS` to tune queue behavior.
 `tools/list` responses are cached (per instance + global fallback) so transient queue/network failures do not drop remote `ida_*` tools from the client.
 `list_instances` defaults to registration-only mode (`probe=false`) to avoid pinging every IDA instance on each call.
+Automatic failover is enabled by default (`IDA_MCP_AUTO_FAILOVER=1`): if the active instance becomes unreachable, the proxy retries against a reachable candidate and updates the active instance.
+Use `IDA_MCP_AUTO_FAILOVER_PROBE_TIMEOUT_SECONDS` and `IDA_MCP_AUTO_FAILOVER_MAX_CANDIDATES` to tune failover behavior.
+When a request still fails due to an unreachable target, the proxy now returns a "wrong instance" hint with reachable alternatives (configurable via `IDA_MCP_WRONG_INSTANCE_HINT_CANDIDATES`).
 
 To avoid cross-agent `use_instance` races in shared sessions, you can pin a single call to an instance by passing `_instance` inside tool arguments:
 

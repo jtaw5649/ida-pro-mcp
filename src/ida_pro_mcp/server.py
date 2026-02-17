@@ -118,11 +118,31 @@ def _parse_float_env(name: str, default: float) -> float:
         return default
 
 
+def _parse_int_env(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value, 0)
+    except ValueError:
+        return default
+
+
 QUEUE_AUTOSCALE_ENABLED = _parse_bool_env("IDA_MCP_QUEUE_AUTOSCALE", True)
 QUEUE_AUTOSCALE_HEADROOM = max(
     _parse_float_env("IDA_MCP_QUEUE_AUTOSCALE_HEADROOM_SECONDS", 15.0), 0.0
 )
 QUEUE_AUTOSCALE_MAX = _parse_float_env("IDA_MCP_QUEUE_AUTOSCALE_MAX_SECONDS", 0.0)
+AUTO_FAILOVER_ENABLED = _parse_bool_env("IDA_MCP_AUTO_FAILOVER", True)
+AUTO_FAILOVER_PROBE_TIMEOUT_SECONDS = max(
+    _parse_float_env("IDA_MCP_AUTO_FAILOVER_PROBE_TIMEOUT_SECONDS", 2.0), 0.1
+)
+AUTO_FAILOVER_MAX_CANDIDATES = max(
+    _parse_int_env("IDA_MCP_AUTO_FAILOVER_MAX_CANDIDATES", 8), 1
+)
+WRONG_INSTANCE_HINT_CANDIDATES = max(
+    _parse_int_env("IDA_MCP_WRONG_INSTANCE_HINT_CANDIDATES", 3), 1
+)
 
 mcp = McpServer("ida-pro-mcp")
 dispatch_original = mcp.registry.dispatch
@@ -299,6 +319,177 @@ def _list_instances_snapshot() -> tuple[str, list[tuple[str, dict[str, Any]]]]:
         current = IDA_CURRENT_INSTANCE
         pairs = [(name, dict(endpoint)) for name, endpoint in IDA_INSTANCES.items()]
         return current, pairs
+
+
+def _instance_started_at(endpoint: dict[str, Any]) -> float:
+    value = endpoint.get("started_at")
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _is_unreachable_dispatch_error(error: Exception) -> bool:
+    if isinstance(error, TimeoutError):
+        return False
+    if isinstance(
+        error,
+        (
+            ConnectionRefusedError,
+            ConnectionResetError,
+            ConnectionAbortedError,
+            BrokenPipeError,
+            http.client.RemoteDisconnected,
+        ),
+    ):
+        return True
+
+    text = str(error).lower()
+    unreachable_markers = (
+        "connection refused",
+        "actively refused",
+        "forcibly closed",
+        "connection reset by peer",
+        "remote end closed connection",
+        "[winerror 10061]",
+        "[winerror 10054]",
+        "[errno 111]",
+    )
+    return any(marker in text for marker in unreachable_markers)
+
+
+def _ordered_failover_candidates(
+    failed_instance: str | None,
+) -> list[tuple[str, dict[str, Any]]]:
+    current, pairs = _list_instances_snapshot()
+
+    failed_endpoint: dict[str, Any] | None = None
+    if isinstance(failed_instance, str):
+        for name, endpoint in pairs:
+            if name == failed_instance:
+                failed_endpoint = endpoint
+                break
+
+    failed_module = (
+        failed_endpoint.get("module") if isinstance(failed_endpoint, dict) else None
+    )
+    failed_idb = (
+        failed_endpoint.get("idb_path") if isinstance(failed_endpoint, dict) else None
+    )
+
+    candidates = [
+        (name, endpoint) for name, endpoint in pairs if name != failed_instance
+    ]
+
+    def candidate_key(item: tuple[str, dict[str, Any]]) -> tuple[int, int, float, str]:
+        name, endpoint = item
+        same_module = (
+            isinstance(failed_module, str)
+            and failed_module != ""
+            and endpoint.get("module") == failed_module
+        )
+        same_idb = (
+            isinstance(failed_idb, str)
+            and failed_idb != ""
+            and endpoint.get("idb_path") == failed_idb
+        )
+        if same_module and same_idb:
+            match_rank = 0
+        elif same_module:
+            match_rank = 1
+        elif same_idb:
+            match_rank = 2
+        else:
+            match_rank = 3
+
+        active_rank = 0 if name == current else 1
+        started_rank = -_instance_started_at(endpoint)
+        return (match_rank, active_rank, started_rank, name)
+
+    candidates.sort(key=candidate_key)
+    return candidates
+
+
+def _select_reachable_failover_instance(failed_instance: str | None) -> str | None:
+    probe_timeout = min(max(AUTO_FAILOVER_PROBE_TIMEOUT_SECONDS, 0.1), 30.0)
+    tested = 0
+    for name, _endpoint in _ordered_failover_candidates(failed_instance):
+        if tested >= AUTO_FAILOVER_MAX_CANDIDATES:
+            break
+        tested += 1
+        error = _ping_instance(name, timeout=probe_timeout)
+        if error is None:
+            return name
+    return None
+
+
+def _extract_pinned_instance(request_obj: JsonRpcRequest) -> str | None:
+    if request_obj.get("method") != "tools/call":
+        return None
+    params = request_obj.get("params")
+    if not isinstance(params, dict):
+        return None
+    arguments = params.get("arguments")
+    if not isinstance(arguments, dict):
+        return None
+    pinned = arguments.get("_instance")
+    if isinstance(pinned, str) and pinned.strip():
+        return pinned.strip()
+    return None
+
+
+def _reachable_instances_for_hint(
+    failed_instance: str | None,
+) -> list[tuple[str, dict[str, Any]]]:
+    probe_timeout = min(max(AUTO_FAILOVER_PROBE_TIMEOUT_SECONDS, 0.1), 1.0)
+    max_candidates = max(AUTO_FAILOVER_MAX_CANDIDATES, WRONG_INSTANCE_HINT_CANDIDATES)
+
+    reachable: list[tuple[str, dict[str, Any]]] = []
+    tested = 0
+    for name, endpoint in _ordered_failover_candidates(failed_instance):
+        if tested >= max_candidates:
+            break
+        tested += 1
+        if _ping_instance(name, timeout=probe_timeout) is None:
+            reachable.append((name, endpoint))
+            if len(reachable) >= WRONG_INSTANCE_HINT_CANDIDATES:
+                break
+
+    return reachable
+
+
+def _wrong_instance_hint(
+    request_obj: JsonRpcRequest,
+    failed_instance: str | None,
+) -> str | None:
+    reachable = _reachable_instances_for_hint(failed_instance)
+    if not reachable:
+        return None
+
+    pinned_instance = _extract_pinned_instance(request_obj)
+    recommended_name, recommended_endpoint = reachable[0]
+    recommended_module = recommended_endpoint.get("module")
+    reachable_names = ", ".join(name for name, _ in reachable)
+
+    if isinstance(recommended_module, str) and recommended_module:
+        target_display = f"{recommended_name} ({recommended_module})"
+    else:
+        target_display = recommended_name
+
+    if pinned_instance is not None:
+        intro = f"This call was pinned to _instance='{pinned_instance}', which appears unreachable."
+    else:
+        intro = "The selected instance appears unreachable."
+
+    return (
+        f"{intro} Reachable instances now: {reachable_names}. "
+        f"Try use_instance(name='{recommended_name}') or pin calls with _instance='{recommended_name}'. "
+        f"Suggested target: {target_display}."
+    )
 
 
 def _request_label(request_obj: JsonRpcRequest) -> str:
@@ -551,7 +742,7 @@ def _dispatch_to_ida(
     request_obj: JsonRpcRequest,
     *,
     instance_name: str | None = None,
-    timeout: int = 30,
+    timeout: float = 30,
     queue_timeout: float | None = None,
     request_timeout: float | None = None,
 ) -> JsonRpcResponse | None:
@@ -689,6 +880,10 @@ def _error_response(
             f"Failed to connect to IDA Pro instance '{endpoint_desc}'! "
             f"Did you run Edit -> Plugins -> MCP ({shortcut}) to start the server?\n{full_info}"
         )
+        if _is_unreachable_dispatch_error(e):
+            hint = _wrong_instance_hint(request_obj, instance_name)
+            if hint:
+                message += f"\nHint: {hint}"
 
     return JsonRpcResponse(
         {
@@ -716,7 +911,7 @@ def _extract_tools(response: JsonRpcResponse | None) -> list[dict]:
 
 
 def _read_instance_metadata(
-    instance_name: str, *, timeout: int = 5
+    instance_name: str, *, timeout: float = 5
 ) -> tuple[dict | None, str | None]:
     try:
         response = _dispatch_to_ida(
@@ -766,7 +961,7 @@ def _read_instance_metadata(
     return metadata, None
 
 
-def _ping_instance(instance_name: str, *, timeout: int = 5) -> str | None:
+def _ping_instance(instance_name: str, *, timeout: float = 5) -> str | None:
     try:
         response = _dispatch_to_ida(
             {
@@ -1508,6 +1703,7 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
     method = request_obj.get("method")
     forward_request_obj: JsonRpcRequest = cast(JsonRpcRequest, dict(request_obj))
     target_instance: str | None = None
+    instance_pinned = False
 
     if AUTO_DISCOVERY_ENABLED and method in {
         "tools/list",
@@ -1593,6 +1789,7 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
                 instance_override = arguments.get("_instance")
                 if isinstance(instance_override, str) and instance_override.strip():
                     target_instance = instance_override.strip()
+                    instance_pinned = True
                     sanitized_args = dict(arguments)
                     sanitized_args.pop("_instance", None)
                     sanitized_params = dict(params)
@@ -1621,38 +1818,81 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
         )
         return response
     except Exception as e:
+        last_error = e
         if AUTO_DISCOVERY_ENABLED:
             _refresh_auto_instances()
-            try:
-                with STATE_LOCK:
-                    target_missing = target_instance not in IDA_INSTANCES
-                if target_missing:
-                    with STATE_LOCK:
-                        target_instance = IDA_CURRENT_INSTANCE
 
+        retry_plan: list[tuple[str, str, str]] = []
+        with STATE_LOCK:
+            target_missing = target_instance not in IDA_INSTANCES
+            current_after_refresh = IDA_CURRENT_INSTANCE
+
+        if target_missing and isinstance(current_after_refresh, str):
+            retry_plan.append(
+                (current_after_refresh, "remote_after_auto_refresh", "target_missing")
+            )
+
+        if (
+            AUTO_FAILOVER_ENABLED
+            and not instance_pinned
+            and _is_unreachable_dispatch_error(last_error)
+        ):
+            failover_instance = _select_reachable_failover_instance(target_instance)
+            if (
+                isinstance(failover_instance, str)
+                and failover_instance
+                and failover_instance != target_instance
+            ):
+                retry_plan.append(
+                    (
+                        failover_instance,
+                        "remote_after_failover",
+                        f"failed_instance={target_instance}",
+                    )
+                )
+
+        seen_instances: set[str] = set()
+        for retry_instance, route, reason in retry_plan:
+            if retry_instance in seen_instances:
+                continue
+            seen_instances.add(retry_instance)
+
+            try:
                 response = _dispatch_to_ida(
                     forward_request_obj,
-                    instance_name=target_instance,
+                    instance_name=retry_instance,
                     queue_timeout=queue_timeout,
                     request_timeout=request_timeout,
                 )
+                target_instance = retry_instance
+                if route == "remote_after_failover":
+                    try:
+                        _set_active_instance(retry_instance)
+                    except Exception:
+                        pass
                 _trace_record(
                     request_obj,
                     response,
-                    route="remote_after_auto_refresh",
-                    instance_name=target_instance,
+                    route=route,
+                    instance_name=retry_instance,
+                    error=reason,
                 )
                 return response
             except Exception as retry_error:
-                e = retry_error
+                last_error = retry_error
+                target_instance = retry_instance
 
-        response = _error_response(request_obj, e, instance_name=target_instance)
+        response = _error_response(
+            request_obj,
+            last_error,
+            instance_name=target_instance,
+        )
         _trace_record(
             request_obj,
             response,
             route="remote_error",
             instance_name=target_instance,
-            error=str(e),
+            error=str(last_error),
         )
         return response
 
