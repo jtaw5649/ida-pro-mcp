@@ -4,7 +4,18 @@ import os
 import threading
 import time
 import traceback
-from typing import Any, Callable, get_type_hints, get_origin, get_args, Union, TypedDict, TypeAlias, NotRequired, is_typeddict
+from typing import (
+    Any,
+    Callable,
+    get_type_hints,
+    get_origin,
+    get_args,
+    Union,
+    TypedDict,
+    TypeAlias,
+    NotRequired,
+    is_typeddict,
+)
 from types import UnionType
 
 JsonRpcId: TypeAlias = str | int | float | None
@@ -68,10 +79,30 @@ def _parse_bool_env(name: str, default: bool) -> bool:
 _LOG_REQUESTS = _parse_bool_env("IDA_MCP_LOG_REQUESTS", True)
 _LOG_SKIP_METHODS = {
     m.strip()
-    for m in os.getenv("IDA_MCP_LOG_SKIP_METHODS", "tools/call").split(",")
+    for m in os.getenv("IDA_MCP_LOG_SKIP_METHODS", "tools/call,ping,tools/list").split(
+        ","
+    )
     if m.strip()
 }
 JsonRpcParams: TypeAlias = dict[str, Any] | list[Any] | None
+
+
+def _is_metadata_probe(method: str, params: JsonRpcParams) -> bool:
+    if method != "resources/read" or not isinstance(params, dict):
+        return False
+    uri = params.get("uri")
+    return isinstance(uri, str) and uri == "ida://idb/metadata"
+
+
+def _should_log_request(method: str, params: JsonRpcParams) -> bool:
+    if not _LOG_REQUESTS:
+        return False
+    if method in _LOG_SKIP_METHODS:
+        return False
+    if _is_metadata_probe(method, params):
+        return False
+    return True
+
 
 class JsonRpcRequest(TypedDict):
     jsonrpc: str
@@ -79,16 +110,19 @@ class JsonRpcRequest(TypedDict):
     params: NotRequired[JsonRpcParams]
     id: NotRequired[JsonRpcId]
 
+
 class JsonRpcError(TypedDict):
     code: int
     message: str
     data: NotRequired[Any]
+
 
 class JsonRpcResponse(TypedDict):
     jsonrpc: str
     result: NotRequired[Any]
     error: NotRequired[JsonRpcError]
     id: JsonRpcId
+
 
 class JsonRpcException(Exception):
     def __init__(self, code: int, message: str, data: Any = None):
@@ -99,7 +133,9 @@ class JsonRpcException(Exception):
 
 class RequestCancelledError(Exception):
     """Base class for request cancellation errors (LSP error code -32800)."""
+
     pass
+
 
 class JsonRpcRegistry:
     def __init__(self):
@@ -108,15 +144,19 @@ class JsonRpcRegistry:
         self.redact_exceptions = False
 
     def method(self, func: Callable, name: str | None = None) -> Callable:
-        self.methods[name or func.__name__] = func # type: ignore
+        self.methods[name or func.__name__] = func  # type: ignore
         return func
 
-    def dispatch(self, request: dict | str | bytes | bytearray) -> JsonRpcResponse | None:
+    def dispatch(
+        self, request: dict | str | bytes | bytearray
+    ) -> JsonRpcResponse | None:
         try:
             if not isinstance(request, dict):
                 request = json.loads(request)
             if not isinstance(request, dict):
-                return self._error(None, -32600, "Invalid request: must be a JSON object")
+                return self._error(
+                    None, -32600, "Invalid request: must be a JSON object"
+                )
         except Exception as e:
             return self._error(None, -32700, "JSON parse error", str(e))
 
@@ -127,13 +167,15 @@ class JsonRpcRegistry:
         if method is None:
             return self._error(None, -32600, "Invalid request: 'method' is required")
         if not isinstance(method, str):
-            return self._error(None, -32600, "Invalid request: 'method' must be a string")
+            return self._error(
+                None, -32600, "Invalid request: 'method' must be a string"
+            )
 
         request_id: JsonRpcId = request.get("id")
         is_notification = "id" not in request
         params: JsonRpcParams = request.get("params")
 
-        log_method = _LOG_REQUESTS and method not in _LOG_SKIP_METHODS
+        log_method = _should_log_request(method, params)
         if log_method:
             params_str = json.dumps(params, default=str)
             if len(params_str) > 200:
@@ -180,7 +222,9 @@ class JsonRpcRegistry:
             if is_notification:
                 return None
             error = self.map_exception(e)
-            return self._error(request_id, error["code"], error["message"], error.get("data"))
+            return self._error(
+                request_id, error["code"], error["message"], error.get("data")
+            )
         finally:
             _current_request.id = None
 
@@ -192,7 +236,8 @@ class JsonRpcRegistry:
             }
         return {
             "code": -32603,
-            "message": "\n".join(traceback.format_exception(e)).strip() + "\n\nPlease report a bug!",
+            "message": "\n".join(traceback.format_exception(e)).strip()
+            + "\n\nPlease report a bug!",
         }
 
     def _call(self, method: str, params: Any) -> Any:
@@ -229,12 +274,12 @@ class JsonRpcRegistry:
             if len(params) < len(required_params):
                 raise JsonRpcException(
                     -32602,
-                    f"Invalid params: expected at least {len(required_params)} arguments, got {len(params)}"
+                    f"Invalid params: expected at least {len(required_params)} arguments, got {len(params)}",
                 )
             if len(params) > len(sig.parameters):
                 raise JsonRpcException(
                     -32602,
-                    f"Invalid params: expected at most {len(sig.parameters)} arguments, got {len(params)}"
+                    f"Invalid params: expected at most {len(sig.parameters)} arguments, got {len(params)}",
                 )
             params = dict(zip(sig.parameters.keys(), params))
 
@@ -245,15 +290,14 @@ class JsonRpcRegistry:
             if missing:
                 raise JsonRpcException(
                     -32602,
-                    f"Invalid params: missing required parameters: {list(missing)}"
+                    f"Invalid params: missing required parameters: {list(missing)}",
                 )
 
             # Check no extra params
             extra = set(params.keys()) - set(sig.parameters.keys())
             if extra:
                 raise JsonRpcException(
-                    -32602,
-                    f"Invalid params: unexpected parameters: {list(extra)}"
+                    -32602, f"Invalid params: unexpected parameters: {list(extra)}"
                 )
 
             validated_params = {}
@@ -275,7 +319,9 @@ class JsonRpcRegistry:
                     if expected_type is not type(None):
                         # Check if None is allowed in a Union
                         if not (origin in (Union, UnionType) and type(None) in args):
-                            raise JsonRpcException(-32602, f"Invalid params: {param_name} cannot be null")
+                            raise JsonRpcException(
+                                -32602, f"Invalid params: {param_name} cannot be null"
+                            )
                     validated_params[param_name] = None
                     continue
 
@@ -284,7 +330,7 @@ class JsonRpcRegistry:
                     type_matched = False
 
                     # HACK: Try to parse str as JSON for non-str unions
-                    # 
+                    #
                     # When JSON schema says one field is "object", Claude Code
                     # (and maybe other MCP clients) can't (or won't) detect
                     # that the field is actually a dict/list. Instead, they
@@ -315,14 +361,17 @@ class JsonRpcRegistry:
                             break
 
                     if not type_matched:
-                        raise JsonRpcException(-32602, "Invalid params: expected {} for {}, got {}".format(
-                            " | ".join(
-                                t.__name__ if isinstance(t, type) else str(t)
-                                for t in args
+                        raise JsonRpcException(
+                            -32602,
+                            "Invalid params: expected {} for {}, got {}".format(
+                                " | ".join(
+                                    t.__name__ if isinstance(t, type) else str(t)
+                                    for t in args
+                                ),
+                                param_name,
+                                type(value).__name__,
                             ),
-                            param_name,
-                            type(value).__name__
-                        ))
+                        )
                     validated_params[param_name] = value
                     continue
 
@@ -331,7 +380,7 @@ class JsonRpcRegistry:
                     if not isinstance(value, origin):
                         raise JsonRpcException(
                             -32602,
-                            f"Invalid params: {param_name} expected {origin.__name__}, got {type(value).__name__}"
+                            f"Invalid params: {param_name} expected {origin.__name__}, got {type(value).__name__}",
                         )
                     validated_params[param_name] = value
                     continue
@@ -341,7 +390,7 @@ class JsonRpcRegistry:
                     if not isinstance(value, dict):
                         raise JsonRpcException(
                             -32602,
-                            f"Invalid params: {param_name} expected dict, got {type(value).__name__}"
+                            f"Invalid params: {param_name} expected dict, got {type(value).__name__}",
                         )
                     validated_params[param_name] = value
                     continue
@@ -360,7 +409,7 @@ class JsonRpcRegistry:
                     if not isinstance(value, expected_type):
                         raise JsonRpcException(
                             -32602,
-                            f"Invalid params: {param_name} expected {expected_type.__name__}, got {type(value).__name__}"
+                            f"Invalid params: {param_name} expected {expected_type.__name__}, got {type(value).__name__}",
                         )
                     validated_params[param_name] = value
                     continue
@@ -370,7 +419,9 @@ class JsonRpcRegistry:
         else:
             raise JsonRpcException(-32602, "Invalid params: must be array or object")
 
-    def _error(self, request_id: JsonRpcId, code: int, message: str, data: Any = None) -> JsonRpcResponse | None:
+    def _error(
+        self, request_id: JsonRpcId, code: int, message: str, data: Any = None
+    ) -> JsonRpcResponse | None:
         error: JsonRpcError = {
             "code": code,
             "message": message,

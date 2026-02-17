@@ -7,6 +7,7 @@ import ida_bytes
 import ida_frame
 import ida_ida
 import idaapi
+import idc
 
 from .rpc import tool
 from .sync import idasync, ida_major
@@ -16,6 +17,7 @@ from .utils import (
     parse_address,
     get_type_by_name,
     parse_decls_ctypes,
+    paginate,
     my_modifier_t,
     StructRead,
     TypeEdit,
@@ -259,6 +261,278 @@ def search_structs(
                     )
 
     return results
+
+
+# ============================================================================
+# Enum Operations
+# ============================================================================
+
+
+def _resolve_enum_id(query: str | int) -> tuple[int, str | None]:
+    enum_id = idc.BADADDR
+    enum_name: str | None = None
+
+    if isinstance(query, int):
+        enum_id = query
+        enum_name = idc.get_enum_name(enum_id)
+        return enum_id, enum_name
+
+    text = query.strip()
+    if not text:
+        return idc.BADADDR, None
+
+    try:
+        enum_id = int(text, 0)
+        enum_name = idc.get_enum_name(enum_id)
+        if enum_name:
+            return enum_id, enum_name
+    except ValueError:
+        pass
+
+    enum_id = idc.get_enum(text)
+    if enum_id != idc.BADADDR:
+        enum_name = idc.get_enum_name(enum_id) or text
+        return enum_id, enum_name
+
+    return idc.BADADDR, None
+
+
+def _iter_enum_members(enum_id: int, max_members: int = 10000) -> list[dict]:
+    members = []
+
+    value = idc.get_first_enum_member(enum_id, -1)
+    while value != idc.BADADDR and len(members) < max_members:
+        serial = 0
+        while len(members) < max_members:
+            const_id = idc.get_enum_member(enum_id, value, serial, -1)
+            if const_id == idc.BADADDR:
+                break
+
+            bmask = idc.get_enum_member_bmask(const_id)
+            if bmask is None:
+                bmask = -1
+
+            members.append(
+                {
+                    "name": idc.get_enum_member_name(const_id) or f"<member_{serial}>",
+                    "value": idc.get_enum_member_value(const_id),
+                    "value_hex": hex(idc.get_enum_member_value(const_id)),
+                    "serial": serial,
+                    "bmask": bmask,
+                    "bmask_hex": hex(bmask & 0xFFFFFFFFFFFFFFFF),
+                    "comment": idc.get_enum_member_cmt(const_id, False),
+                }
+            )
+            serial += 1
+
+        next_value = idc.get_next_enum_member(enum_id, value, -1)
+        if next_value == value:
+            break
+        value = next_value
+
+    return members
+
+
+@tool
+@idasync
+def list_enums(
+    filter: Annotated[str, "Optional case-insensitive name filter"] = "",
+    offset: Annotated[int, "Starting index (default: 0)"] = 0,
+    count: Annotated[int, "Maximum number of results (default: 100, 0 for all)"] = 100,
+) -> object:
+    """List enums in local types with pagination"""
+    offset = max(offset, 0)
+    if count < 0:
+        count = 0
+
+    out = []
+    limit = ida_typeinf.get_ordinal_limit()
+    needle = filter.lower().strip()
+
+    for ordinal in range(1, limit):
+        tif = ida_typeinf.tinfo_t()
+        if not tif.get_numbered_type(None, ordinal):
+            continue
+        if not tif.is_enum():
+            continue
+
+        enum_name = tif.get_type_name() or f"<enum_{ordinal}>"
+        if needle and needle not in enum_name.lower():
+            continue
+
+        enum_id = idc.get_enum(enum_name)
+        out.append(
+            {
+                "name": enum_name,
+                "ordinal": ordinal,
+                "enum_id": hex(enum_id) if enum_id != idc.BADADDR else None,
+                "width": tif.get_enum_width(),
+                "member_count": tif.get_enum_nmembers(),
+                "is_bitfield": tif.is_bitmask_enum(),
+            }
+        )
+
+    return paginate(out, offset, count)
+
+
+@tool
+@idasync
+def get_enum(
+    query: Annotated[str, "Enum name or enum id (hex/decimal)"],
+    include_members: Annotated[bool, "Include enum members (default: true)"] = True,
+    max_members: Annotated[int, "Maximum members to return (default: 5000)"] = 5000,
+) -> dict:
+    """Get enum details by name or id"""
+    enum_id, enum_name = _resolve_enum_id(query)
+
+    if enum_id == idc.BADADDR or enum_name is None:
+        return {"query": query, "enum": None, "error": f"Enum not found: {query}"}
+
+    tif = ida_typeinf.tinfo_t()
+    has_tif = tif.get_named_type(None, enum_name) and tif.is_enum()
+
+    members = []
+    if include_members:
+        if max_members <= 0:
+            max_members = 5000
+        members = _iter_enum_members(enum_id, max_members=max_members)
+
+    return {
+        "query": query,
+        "enum": {
+            "id": hex(enum_id),
+            "name": enum_name,
+            "width": tif.get_enum_width() if has_tif else idc.get_enum_width(enum_id),
+            "member_count": (tif.get_enum_nmembers() if has_tif else len(members)),
+            "is_bitfield": (
+                tif.is_bitmask_enum() if has_tif else bool(idc.get_enum_flag(enum_id))
+            ),
+            "comment": idc.get_enum_cmt(enum_id, False),
+            "members": members,
+        },
+    }
+
+
+@tool
+@idasync
+def set_enum_member(
+    enum: Annotated[str, "Enum name or id to modify"],
+    name: Annotated[str, "Member name"],
+    value: Annotated[str | int, "Member value (decimal or 0x...)"],
+    bmask: Annotated[str | int, "Bitmask for bitfield enums (default: -1)"] = "-1",
+    replace_existing: Annotated[
+        bool, "Replace existing same-name member in the same enum (default: true)"
+    ] = True,
+) -> dict:
+    """Create or update an enum member"""
+    enum_id, enum_name = _resolve_enum_id(enum)
+    if enum_id == idc.BADADDR:
+        enum_name = enum.strip()
+        if not enum_name:
+            return {"ok": False, "error": "enum name is required"}
+        enum_id = idc.add_enum(-1, enum_name, 0)
+        if enum_id == idc.BADADDR:
+            return {
+                "ok": False,
+                "error": f"Failed to create enum '{enum_name}'",
+            }
+
+    try:
+        value_int = int(value, 0) if isinstance(value, str) else int(value)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": f"Invalid value: {value}"}
+
+    try:
+        bmask_int = int(bmask, 0) if isinstance(bmask, str) else int(bmask)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": f"Invalid bmask: {bmask}"}
+
+    existing_const = idc.get_enum_member_by_name(name)
+    if existing_const != idc.BADADDR:
+        owner_enum = idc.get_enum_member_enum(existing_const)
+        if owner_enum != enum_id:
+            return {
+                "ok": False,
+                "error": (
+                    f"Member name '{name}' is already used by another enum "
+                    f"({idc.get_enum_name(owner_enum) or hex(owner_enum)})"
+                ),
+            }
+
+        if replace_existing:
+            existing_value = idc.get_enum_member_value(existing_const)
+            found_serial = 0
+            for serial in range(256):
+                cid = idc.get_enum_member(enum_id, existing_value, serial, -1)
+                if cid == idc.BADADDR:
+                    break
+                if cid == existing_const:
+                    found_serial = serial
+                    break
+
+            if not idc.del_enum_member(enum_id, existing_value, found_serial, -1):
+                return {
+                    "ok": False,
+                    "error": f"Failed to remove existing member '{name}'",
+                }
+        else:
+            return {
+                "ok": False,
+                "error": f"Member '{name}' already exists (set replace_existing=true to overwrite)",
+            }
+
+    add_result = idc.add_enum_member(enum_id, name, value_int, bmask_int)
+    if add_result != 0:
+        return {
+            "ok": False,
+            "error": f"add_enum_member failed with code {add_result}",
+            "enum": idc.get_enum_name(enum_id) or hex(enum_id),
+            "member": name,
+        }
+
+    return {
+        "ok": True,
+        "enum": idc.get_enum_name(enum_id) or hex(enum_id),
+        "enum_id": hex(enum_id),
+        "member": {
+            "name": name,
+            "value": value_int,
+            "value_hex": hex(value_int),
+            "bmask": bmask_int,
+        },
+    }
+
+
+@tool
+@idasync
+def apply_enum(
+    addr: Annotated[str, "Address to apply enum representation to"],
+    enum: Annotated[str, "Enum name or id"],
+    operand: Annotated[int, "Operand index (default: 0)"] = 0,
+    serial: Annotated[int, "Enum serial (default: 0)"] = 0,
+) -> dict:
+    """Apply enum representation to an operand at an address"""
+    enum_id, enum_name = _resolve_enum_id(enum)
+    if enum_id == idc.BADADDR:
+        return {"ok": False, "error": f"Enum not found: {enum}"}
+
+    ea = parse_address(addr)
+    success = idc.op_enum(ea, operand, enum_id, serial)
+    if not success:
+        return {
+            "ok": False,
+            "error": f"Failed to apply enum at {hex(ea)} operand {operand}",
+            "enum": enum_name or hex(enum_id),
+        }
+
+    return {
+        "ok": True,
+        "addr": hex(ea),
+        "operand": operand,
+        "serial": serial,
+        "enum": enum_name or hex(enum_id),
+        "enum_id": hex(enum_id),
+    }
 
 
 # ============================================================================

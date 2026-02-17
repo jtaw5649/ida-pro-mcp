@@ -1,4 +1,5 @@
 from itertools import islice
+import re
 import struct
 from typing import Annotated, Optional
 import ida_lines
@@ -39,6 +40,14 @@ from .utils import (
 # ============================================================================
 
 _IMM_SCAN_BACK_MAX = 15
+_ADDR_COMMENT_RE = re.compile(r"\s*/\*0x[0-9a-fA-F]+\*/\s*$")
+_LOCAL_DECL_RE = re.compile(
+    r"^\s*(?:"
+    r"const\s+|volatile\s+|unsigned\s+|signed\s+|struct\s+|union\s+|enum\s+|"
+    r"__int\d+\s+|_DWORD\s+|_QWORD\s+|_BYTE\s+|_WORD\s+|"
+    r"char\s+|short\s+|int\s+|long\s+|float\s+|double\s+|bool\s+|void\s+|wchar_t\s+"
+    r").+;\s*$"
+)
 
 
 def _raw_bin_search(
@@ -141,6 +150,55 @@ def _value_candidates_for_immediate(value: int) -> list[tuple[int, int, bytes]]:
     return candidates
 
 
+def _is_local_decl_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if stripped.startswith("//") or stripped.startswith("/*"):
+        return False
+    return bool(_LOCAL_DECL_RE.match(line))
+
+
+def _collapse_local_declarations(lines: list[str]) -> list[str]:
+    if not lines:
+        return lines
+
+    open_brace_idx = None
+    for i, line in enumerate(lines):
+        if "{" in line:
+            open_brace_idx = i
+            break
+
+    if open_brace_idx is None:
+        return lines
+
+    decl_start = open_brace_idx + 1
+    i = decl_start
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+
+    decl_count = 0
+    while i < len(lines) and _is_local_decl_line(lines[i]):
+        decl_count += 1
+        i += 1
+
+    if decl_count == 0:
+        return lines
+
+    out = lines[:decl_start]
+    out.append(f"  /* {decl_count} local declaration(s) collapsed */")
+    out.extend(lines[i:])
+    return out
+
+
+def _truncate_decomp_lines(lines: list[str], max_lines: int) -> list[str]:
+    if max_lines <= 0 or len(lines) <= max_lines:
+        return lines
+
+    omitted = len(lines) - max_lines
+    return lines[:max_lines] + [f"/* ... truncated {omitted} line(s) ... */"]
+
+
 def _resolve_immediate_insn_start(
     match_ea: int,
     value: int,
@@ -182,6 +240,18 @@ def _resolve_immediate_insn_start(
 @tool_timeout(90.0)
 def decompile(
     addr: Annotated[str, "Function address to decompile"],
+    collapse_locals: Annotated[
+        bool,
+        "Collapse initial local declaration block to reduce output size (default: false)",
+    ] = False,
+    max_lines: Annotated[
+        int,
+        "Maximum pseudocode lines to return (default: 0 = unlimited)",
+    ] = 0,
+    strip_addr_comments: Annotated[
+        bool,
+        "Strip trailing /*0x...*/ address comments from pseudocode lines (default: false)",
+    ] = False,
 ) -> dict:
     """Decompile function to pseudocode"""
     try:
@@ -189,6 +259,17 @@ def decompile(
         code = decompile_function_safe(start)
         if code is None:
             return {"addr": addr, "code": None, "error": "Decompilation failed"}
+
+        lines = code.splitlines()
+        if strip_addr_comments:
+            lines = [_ADDR_COMMENT_RE.sub("", line) for line in lines]
+        if collapse_locals:
+            lines = _collapse_local_declarations(lines)
+        if max_lines < 0:
+            max_lines = 0
+        lines = _truncate_decomp_lines(lines, max_lines)
+
+        code = "\n".join(lines)
         return {"addr": addr, "code": code}
     except Exception as e:
         return {"addr": addr, "code": None, "error": str(e)}
@@ -366,6 +447,42 @@ def xrefs_to(
                         addr=hex(xref.frm),
                         type="code" if xref.iscode else "data",
                         fn=get_function(xref.frm, raise_error=False),
+                    )
+                )
+            results.append({"addr": addr, "xrefs": xrefs, "more": more})
+        except Exception as e:
+            results.append({"addr": addr, "xrefs": None, "error": str(e)})
+
+    return results
+
+
+@tool
+@idasync
+def xrefs_from(
+    addrs: Annotated[list[str] | str, "Addresses to find cross-references from"],
+    limit: Annotated[int, "Max xrefs per address (default: 100, max: 1000)"] = 100,
+) -> list[dict]:
+    """Get cross-references from specified addresses"""
+    addrs = normalize_list_input(addrs)
+
+    if limit <= 0 or limit > 1000:
+        limit = 1000
+
+    results = []
+
+    for addr in addrs:
+        try:
+            xrefs = []
+            more = False
+            for xref in idautils.XrefsFrom(parse_address(addr)):
+                if len(xrefs) >= limit:
+                    more = True
+                    break
+                xrefs.append(
+                    Xref(
+                        addr=hex(xref.to),
+                        type="code" if xref.iscode else "data",
+                        fn=get_function(xref.to, raise_error=False),
                     )
                 )
             results.append({"addr": addr, "xrefs": xrefs, "more": more})

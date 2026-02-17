@@ -58,6 +58,9 @@ https://github.com/user-attachments/assets/65ed3373-a187-4dd5-a807-425dca1d8ee9
 
 _Note_: You need to load a binary in IDA before the plugin menu will show up.
 
+To change plugin bind settings without affecting normal startup flow, use `Edit -> Plugins -> MCP Configuration`.
+Set port `0` to auto-bind to a free port at startup.
+
 ## Prompt Engineering
 
 LLMs are prone to hallucinations and you need to be specific with your prompting. For reverse engineering the conversion between integers and bytes are especially problematic. Below is a minimal example prompt, feel free to start a discussion or open an issue if you have good results with a different prompt:
@@ -146,6 +149,69 @@ uv run idalib-mcp --host 127.0.0.1 --port 8745 path/to/executable
 
 _Note_: The `idalib` feature was contributed by [Willi Ballenthin](https://github.com/williballenthin).
 
+## Multi-Instance GUI Routing
+
+The stdio proxy can route to multiple GUI IDA instances when you provide multiple `--ida-rpc` endpoints:
+
+```sh
+uv run ida-pro-mcp \
+  --ida-rpc ida1=http://127.0.0.1:13337/mcp \
+  --ida-rpc ida2=http://127.0.0.1:13338/mcp
+```
+
+When started this way, the proxy exposes local management tools:
+
+- `list_instances(probe, probe_timeout, include_metadata)` - list configured endpoints (optional probe and optional metadata read)
+- `current_instance()` - show currently selected endpoint
+- `use_instance(name)` - switch active endpoint by instance name
+- `refresh_instances(instance_dir)` - refresh auto-discovered instances from registration files
+- `queue_status(instance)` - view queue depth and in-flight work per instance
+- `compare_funcs_cross(instance_a, addr_a, instance_b, addr_b)` - compare functions across two different IDA instances
+- `collect_function_bundle(addrs, instance, include_decompile, include_strings, include_callees, include_xrefs)` - gather common function analysis in one call
+
+Tracing helpers are also available for debugging MCP behavior:
+
+- `trace_start(path, capture_notifications, max_events, clear_existing)`
+- `trace_status()`
+- `trace_export(path, clear_after_export)`
+- `trace_stop()`
+
+All regular IDA tools are forwarded to the currently selected instance.
+Calls to the same IDA instance are serialized through a per-instance queue to avoid IDA main-thread contention.
+Queue wait timeout auto-scales with queue depth (`IDA_MCP_QUEUE_AUTOSCALE=1` by default) to reduce timeouts during bursty multi-agent workloads.
+Use `IDA_MCP_QUEUE_AUTOSCALE_HEADROOM_SECONDS` and `IDA_MCP_QUEUE_AUTOSCALE_MAX_SECONDS` to tune queue behavior.
+`tools/list` responses are cached (per instance + global fallback) so transient queue/network failures do not drop remote `ida_*` tools from the client.
+`list_instances` defaults to registration-only mode (`probe=false`) to avoid pinging every IDA instance on each call.
+
+To avoid cross-agent `use_instance` races in shared sessions, you can pin a single call to an instance by passing `_instance` inside tool arguments:
+
+```json
+{
+  "name": "lookup_funcs",
+  "arguments": {
+    "queries": ["0x180035890"],
+    "_instance": "kore.dll-7156"
+  }
+}
+```
+
+You can also enable automatic instance discovery via plugin registration files:
+
+```sh
+uv run ida-pro-mcp --ida-rpc auto
+```
+
+Optionally, use a custom registration directory:
+
+```sh
+uv run ida-pro-mcp --ida-rpc auto=/path/to/instances
+```
+
+By default, the plugin writes registration files to `%APPDATA%\\ida-pro-mcp\\instances` on Windows and `~/.ida-pro-mcp/instances` on non-Windows systems.
+Auto-discovery requires the proxy process to be able to read that directory (same machine or shared filesystem).
+The remote tool cache file defaults to `%APPDATA%\\ida-pro-mcp\\remote_tools_cache.json` on Windows and `~/.ida-pro-mcp/remote_tools_cache.json` on non-Windows systems (override with `IDA_MCP_TOOLS_CACHE_PATH`).
+Each GUI IDA process must start its plugin server (`Edit -> Plugins -> MCP`, default `Ctrl-Alt-M`) once per process.
+
 
 ## MCP Resources
 
@@ -177,9 +243,10 @@ _Note_: The `idalib` feature was contributed by [Willi Ballenthin](https://githu
 - `list_funcs(queries)`: List functions (paginated, filtered).
 - `list_globals(queries)`: List global variables (paginated, filtered).
 - `imports(offset, count)`: List all imported symbols with module names (paginated).
-- `decompile(addr)`: Decompile function at the given address.
+- `decompile(addr, collapse_locals, max_lines, strip_addr_comments)`: Decompile function with optional output controls.
 - `disasm(addr)`: Disassemble function with full details (arguments, stack frame, etc).
 - `xrefs_to(addrs)`: Get all cross-references to address(es).
+- `xrefs_from(addrs)`: Get all cross-references from address(es).
 - `xrefs_to_field(queries)`: Get cross-references to specific struct field(s).
 - `callees(addrs)`: Get functions called by function(s) at address(es).
 
@@ -254,6 +321,7 @@ http://127.0.0.1:13337/mcp?ext=dbg
 ## Pattern Matching & Search
 
 - `find_regex(queries)`: Search strings with case-insensitive regex (paginated).
+- `find_text(query, sources, regex, case_sensitive, offset, count)`: Search text across strings, names, comments, and disassembly.
 - `find_bytes(patterns, limit=1000, offset=0)`: Find byte pattern(s) in binary (e.g., "48 8B ?? ??"). Max limit: 10000.
 - `find_insns(sequences, limit=1000, offset=0)`: Find instruction sequence(s) in code. Max limit: 10000.
 - `find(type, targets, limit=1000, offset=0)`: Advanced search (immediate values, strings, data/code references). Max limit: 10000.
@@ -266,6 +334,10 @@ http://127.0.0.1:13337/mcp?ext=dbg
 
 - `set_type(edits)`: Apply type(s) to functions, globals, locals, or stack variables.
 - `infer_types(addrs)`: Infer types at address(es) using Hex-Rays or heuristics.
+- `list_enums(filter, offset, count)`: List enums from local types.
+- `get_enum(query, include_members, max_members)`: Retrieve enum details and members.
+- `set_enum_member(enum, name, value, bmask, replace_existing)`: Create or update enum member.
+- `apply_enum(addr, enum, operand, serial)`: Apply enum representation to an operand.
 
 ## Export Operations
 
