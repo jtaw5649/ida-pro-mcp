@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import ctypes
 import shutil
 import argparse
 import http.client
@@ -9,8 +10,10 @@ import traceback
 import difflib
 import threading
 import time
+import itertools
 import tomllib
 import tomli_w
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlparse
 import glob
@@ -31,6 +34,10 @@ IDA_PATH = "/mcp"
 IDA_INSTANCES: dict[str, dict[str, str | int]] = {}
 IDA_CURRENT_INSTANCE = "default"
 STATE_LOCK = threading.RLock()
+SESSION_ACTIVE_INSTANCES: dict[str, str] = {}
+REQUEST_SESSION_CONTEXT = threading.local()
+REQUEST_ID_LOCK = threading.Lock()
+REQUEST_ID_COUNTER = itertools.count(1)
 
 
 class InstanceExecutor:
@@ -68,6 +75,7 @@ class InstanceExecutor:
 INSTANCE_EXECUTORS: dict[str, InstanceExecutor] = {}
 REMOTE_TOOLS_CACHE: dict[str, list[dict[str, Any]]] = {}
 REMOTE_TOOLS_GLOBAL_CACHE: list[dict[str, Any]] = []
+INSTANCE_METADATA_CACHE: dict[str, dict[str, Any]] = {}
 
 
 LOCAL_TOOL_NAMES = {
@@ -143,6 +151,28 @@ AUTO_FAILOVER_MAX_CANDIDATES = max(
 WRONG_INSTANCE_HINT_CANDIDATES = max(
     _parse_int_env("IDA_MCP_WRONG_INSTANCE_HINT_CANDIDATES", 3), 1
 )
+SESSION_ROUTING_ENABLED = _parse_bool_env("IDA_MCP_SESSION_ROUTING", True)
+LIST_METADATA_TIMEOUT_SECONDS = max(
+    _parse_float_env("IDA_MCP_LIST_METADATA_TIMEOUT_SECONDS", 2.0), 0.1
+)
+LIST_METADATA_CACHE_TTL_SECONDS = max(
+    _parse_float_env("IDA_MCP_LIST_METADATA_CACHE_TTL_SECONDS", 10.0), 0.0
+)
+LIST_PARALLEL_PROBE = _parse_bool_env("IDA_MCP_LIST_PARALLEL_PROBE", True)
+LIST_PROBE_MAX_WORKERS = max(_parse_int_env("IDA_MCP_LIST_PROBE_MAX_WORKERS", 4), 1)
+AUTO_REQUIRE_LIVE = _parse_bool_env("IDA_MCP_AUTO_REQUIRE_LIVE", True)
+AUTO_PROBE_TIMEOUT_SECONDS = max(
+    _parse_float_env("IDA_MCP_AUTO_PROBE_TIMEOUT_SECONDS", 0.5), 0.05
+)
+AUTO_PROBE_MAX_WORKERS = max(_parse_int_env("IDA_MCP_AUTO_PROBE_MAX_WORKERS", 8), 1)
+AUTO_STALE_GRACE_SECONDS = max(
+    _parse_float_env("IDA_MCP_AUTO_STALE_GRACE_SECONDS", 90.0), 0.0
+)
+AUTO_HEARTBEAT_MULTIPLIER = max(
+    _parse_float_env("IDA_MCP_AUTO_HEARTBEAT_MULTIPLIER", 3.0), 1.0
+)
+AUTO_PRUNE = _parse_bool_env("IDA_MCP_AUTO_PRUNE", False)
+AUTO_INCLUDE_UNREACHABLE = _parse_bool_env("IDA_MCP_AUTO_INCLUDE_UNREACHABLE", False)
 
 mcp = McpServer("ida-pro-mcp")
 dispatch_original = mcp.registry.dispatch
@@ -314,11 +344,135 @@ def _resolve_instance_and_endpoint(
         return resolved, dict(endpoint)
 
 
+def _extract_request_meta(request_obj: JsonRpcRequest) -> dict[str, Any] | None:
+    params = request_obj.get("params")
+    if not isinstance(params, dict):
+        return None
+    meta = params.get("_meta")
+    if not isinstance(meta, dict):
+        return None
+    return meta
+
+
+def _extract_session_key_from_meta(meta: dict[str, Any] | None) -> str | None:
+    if not isinstance(meta, dict):
+        return None
+
+    for field_name in ("mcpSessionId", "sessionId", "sseSessionId"):
+        value = meta.get(field_name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _extract_session_key(request_obj: JsonRpcRequest) -> str | None:
+    return _extract_session_key_from_meta(_extract_request_meta(request_obj))
+
+
+def _get_request_session_key() -> str | None:
+    session_key = getattr(REQUEST_SESSION_CONTEXT, "session_key", None)
+    if isinstance(session_key, str) and session_key:
+        return session_key
+    return None
+
+
+def _set_request_session_key(session_key: str | None) -> None:
+    if isinstance(session_key, str) and session_key:
+        REQUEST_SESSION_CONTEXT.session_key = session_key
+    else:
+        REQUEST_SESSION_CONTEXT.session_key = None
+
+
+def _session_bound_instance(session_key: str | None) -> str | None:
+    if (
+        not SESSION_ROUTING_ENABLED
+        or not isinstance(session_key, str)
+        or not session_key
+    ):
+        return None
+
+    with STATE_LOCK:
+        instance_name = SESSION_ACTIVE_INSTANCES.get(session_key)
+        if not isinstance(instance_name, str):
+            return None
+        if instance_name not in IDA_INSTANCES:
+            del SESSION_ACTIVE_INSTANCES[session_key]
+            return None
+        return instance_name
+
+
+def _effective_instance_name(session_key: str | None = None) -> str:
+    session_instance = _session_bound_instance(session_key)
+    if session_instance is not None:
+        return session_instance
+
+    with STATE_LOCK:
+        return IDA_CURRENT_INSTANCE
+
+
+def _bind_session_instance(session_key: str, instance_name: str) -> bool:
+    if not SESSION_ROUTING_ENABLED:
+        return False
+    if not session_key or not instance_name:
+        return False
+
+    with STATE_LOCK:
+        if instance_name not in IDA_INSTANCES:
+            return False
+        SESSION_ACTIVE_INSTANCES[session_key] = instance_name
+        return True
+
+
 def _list_instances_snapshot() -> tuple[str, list[tuple[str, dict[str, Any]]]]:
     with STATE_LOCK:
         current = IDA_CURRENT_INSTANCE
         pairs = [(name, dict(endpoint)) for name, endpoint in IDA_INSTANCES.items()]
         return current, pairs
+
+
+def _next_internal_request_id() -> int:
+    with REQUEST_ID_LOCK:
+        return next(REQUEST_ID_COUNTER)
+
+
+def _metadata_timeout_budget(timeout: float | int | None = None) -> float:
+    budget = LIST_METADATA_TIMEOUT_SECONDS
+    if timeout is not None:
+        try:
+            timeout_value = float(timeout)
+            if timeout_value > 0:
+                budget = min(budget, timeout_value)
+        except (TypeError, ValueError):
+            pass
+    return max(budget, 0.1)
+
+
+def _metadata_cache_get(instance_name: str) -> dict[str, Any] | None:
+    now = time.monotonic()
+    with STATE_LOCK:
+        entry = INSTANCE_METADATA_CACHE.get(instance_name)
+        if not isinstance(entry, dict):
+            return None
+        expires_at = entry.get("expires_at")
+        metadata = entry.get("metadata")
+        if not isinstance(expires_at, (int, float)) or now >= float(expires_at):
+            INSTANCE_METADATA_CACHE.pop(instance_name, None)
+            return None
+        if not isinstance(metadata, dict):
+            INSTANCE_METADATA_CACHE.pop(instance_name, None)
+            return None
+        return dict(metadata)
+
+
+def _metadata_cache_put(instance_name: str, metadata: dict[str, Any]) -> None:
+    ttl = LIST_METADATA_CACHE_TTL_SECONDS
+    if ttl <= 0:
+        return
+    with STATE_LOCK:
+        INSTANCE_METADATA_CACHE[instance_name] = {
+            "metadata": dict(metadata),
+            "expires_at": time.monotonic() + ttl,
+        }
 
 
 def _instance_started_at(endpoint: dict[str, Any]) -> float:
@@ -577,14 +731,294 @@ def _remove_instances_by_source(source: str):
         for name in stale:
             del IDA_INSTANCES[name]
             REMOTE_TOOLS_CACHE.pop(name, None)
+            INSTANCE_METADATA_CACHE.pop(name, None)
             executor = INSTANCE_EXECUTORS.get(name)
             if executor is not None:
                 snapshot = executor.snapshot()
                 if snapshot["queued"] == 0 and snapshot["running"] == 0:
                     del INSTANCE_EXECUTORS[name]
 
+        if stale:
+            stale_names = set(stale)
+            stale_sessions = [
+                session_key
+                for session_key, instance_name in SESSION_ACTIVE_INSTANCES.items()
+                if instance_name in stale_names
+            ]
+            for session_key in stale_sessions:
+                del SESSION_ACTIVE_INSTANCES[session_key]
+
+            if IDA_CURRENT_INSTANCE in stale_names:
+                replacement = next(iter(IDA_INSTANCES.keys()), None)
+                if isinstance(replacement, str):
+                    _set_active_instance(replacement)
+
     if stale:
         _save_remote_tools_cache()
+
+
+_WIN32_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_WIN32_PROCESS_QUERY_INFORMATION = 0x0400
+_WIN32_ERROR_ACCESS_DENIED = 5
+_WIN32_ERROR_INVALID_PARAMETER = 87
+_WIN32_STILL_ACTIVE = 259
+
+
+def _win32_open_process(desired_access: int, pid: int) -> Any:
+    windll = getattr(ctypes, "windll", None)
+    if windll is None:
+        raise OSError("ctypes.windll unavailable")
+    kernel32 = getattr(windll, "kernel32", None)
+    if kernel32 is None:
+        raise OSError("kernel32 unavailable")
+    return kernel32.OpenProcess(desired_access, False, pid)
+
+
+def _win32_get_exit_code_process(process_handle: Any) -> int | None:
+    exit_code = ctypes.c_ulong()
+    windll = getattr(ctypes, "windll", None)
+    if windll is None:
+        raise OSError("ctypes.windll unavailable")
+    kernel32 = getattr(windll, "kernel32", None)
+    if kernel32 is None:
+        raise OSError("kernel32 unavailable")
+    ok = kernel32.GetExitCodeProcess(process_handle, ctypes.byref(exit_code))
+    if not ok:
+        return None
+    return int(exit_code.value)
+
+
+def _win32_close_handle(process_handle: Any) -> None:
+    windll = getattr(ctypes, "windll", None)
+    if windll is None:
+        raise OSError("ctypes.windll unavailable")
+    kernel32 = getattr(windll, "kernel32", None)
+    if kernel32 is None:
+        raise OSError("kernel32 unavailable")
+    kernel32.CloseHandle(process_handle)
+
+
+def _win32_get_last_error() -> int:
+    get_last_error = getattr(ctypes, "get_last_error", None)
+    if callable(get_last_error):
+        return int(cast(Any, get_last_error)())
+
+    windll = getattr(ctypes, "windll", None)
+    if windll is None:
+        return 0
+    kernel32 = getattr(windll, "kernel32", None)
+    if kernel32 is None:
+        return 0
+    get_last_error_api = getattr(kernel32, "GetLastError", None)
+    if callable(get_last_error_api):
+        return int(cast(Any, get_last_error_api)())
+    return 0
+
+
+def _pid_is_alive_windows(pid: int) -> bool | None:
+    access_denied = False
+    invalid_parameter = False
+
+    for desired_access in (
+        _WIN32_PROCESS_QUERY_LIMITED_INFORMATION,
+        _WIN32_PROCESS_QUERY_INFORMATION,
+    ):
+        process_handle = _win32_open_process(desired_access, pid)
+        if process_handle:
+            try:
+                exit_code = _win32_get_exit_code_process(process_handle)
+            finally:
+                _win32_close_handle(process_handle)
+
+            if exit_code is None:
+                return None
+            if exit_code == _WIN32_STILL_ACTIVE:
+                return True
+            return False
+
+        last_error = _win32_get_last_error()
+        if last_error == _WIN32_ERROR_ACCESS_DENIED:
+            access_denied = True
+        elif last_error == _WIN32_ERROR_INVALID_PARAMETER:
+            invalid_parameter = True
+
+    if access_denied:
+        return True
+    if invalid_parameter:
+        return False
+    return None
+
+
+def _pid_is_alive(pid: Any) -> bool | None:
+    if isinstance(pid, str):
+        try:
+            pid = int(pid, 0)
+        except ValueError:
+            return None
+    if not isinstance(pid, int):
+        return None
+    if pid <= 0:
+        return None
+
+    if sys.platform == "win32":
+        try:
+            return _pid_is_alive_windows(pid)
+        except Exception:
+            return None
+
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+
+
+def _coerce_float(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _parse_registration_payload(
+    path: str, payload: dict[str, Any]
+) -> tuple[dict[str, Any] | None, str | None]:
+    host = payload.get("host")
+    if not isinstance(host, str) or not host.strip():
+        return None, "Missing host"
+    host = _normalize_bound_host(host.strip())
+
+    port: Any = payload.get("port")
+    if isinstance(port, str):
+        try:
+            port = int(port, 0)
+        except ValueError:
+            port = None
+    if not isinstance(port, int):
+        return None, "Missing/invalid port"
+
+    path_value = payload.get("path")
+    if not isinstance(path_value, str) or not path_value:
+        path_value = "/mcp"
+
+    name = (
+        payload.get("name")
+        or payload.get("registration_id")
+        or payload.get("instance_id")
+        or payload.get("module")
+    )
+    if not isinstance(name, str) or not name.strip():
+        name = f"ida_{port}"
+    name = name.strip()
+
+    started_at = _coerce_float(payload.get("started_at"))
+    if started_at is None:
+        started_at = 0.0
+
+    heartbeat_interval = _coerce_float(payload.get("heartbeat_interval_sec"))
+    if heartbeat_interval is None or heartbeat_interval <= 0:
+        heartbeat_interval = AUTO_STALE_GRACE_SECONDS
+
+    last_heartbeat = _coerce_float(payload.get("last_heartbeat_at"))
+    if last_heartbeat is None:
+        last_heartbeat = started_at
+
+    if last_heartbeat is None:
+        last_heartbeat = 0.0
+
+    now = time.time()
+    heartbeat_age = (
+        max(now - last_heartbeat, 0.0) if last_heartbeat > 0 else float("inf")
+    )
+    stale_by_grace = heartbeat_age > AUTO_STALE_GRACE_SECONDS
+    stale_by_multiplier = heartbeat_age > (
+        heartbeat_interval * AUTO_HEARTBEAT_MULTIPLIER
+    )
+    stale = stale_by_grace and stale_by_multiplier
+
+    pid_alive = _pid_is_alive(payload.get("pid"))
+    if pid_alive is False:
+        stale = True
+
+    registration_id = payload.get("registration_id") or payload.get("instance_id")
+    if isinstance(registration_id, str):
+        registration_id = registration_id.strip()
+    else:
+        registration_id = None
+
+    parsed = {
+        "name": name,
+        "host": host,
+        "port": port,
+        "path": path_value,
+        "source_file": path,
+        "pid": payload.get("pid"),
+        "pid_alive": pid_alive,
+        "module": payload.get("module"),
+        "idb_path": payload.get("idb_path"),
+        "instance_id": payload.get("instance_id"),
+        "registration_id": registration_id,
+        "schema_version": payload.get("schema_version"),
+        "started_at": started_at,
+        "last_heartbeat_at": last_heartbeat,
+        "heartbeat_interval_sec": heartbeat_interval,
+        "heartbeat_age_seconds": heartbeat_age,
+        "stale": stale,
+        "sort_timestamp": max(last_heartbeat, started_at),
+    }
+    return parsed, None
+
+
+def _ping_endpoint(host: str, port: int, path: str, *, timeout: float) -> str | None:
+    conn = http.client.HTTPConnection(host, int(port), timeout=max(timeout, 0.05))
+    try:
+        payload = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "ping",
+                "id": _next_internal_request_id(),
+            }
+        ).encode("utf-8")
+        conn.request("POST", path, payload, {"Content-Type": "application/json"})
+        response = conn.getresponse()
+        data = response.read().decode("utf-8", errors="replace")
+        body = json.loads(data)
+    except Exception as e:
+        return str(e)
+    finally:
+        conn.close()
+
+    if not isinstance(body, dict):
+        return "Invalid ping payload"
+    if "error" in body:
+        error = body.get("error")
+        if isinstance(error, dict):
+            return str(error.get("message", "Unknown error"))
+        return "Unknown error"
+    return None
+
+
+def _auto_discovery_probe(parsed: dict[str, Any]) -> tuple[str, str | None]:
+    if parsed.get("stale"):
+        return "stale", "heartbeat/pid check failed"
+
+    error = _ping_endpoint(
+        str(parsed["host"]),
+        int(parsed["port"]),
+        str(parsed["path"]),
+        timeout=AUTO_PROBE_TIMEOUT_SECONDS,
+    )
+    if error is None:
+        return "alive", None
+    return "unreachable", error
 
 
 def _refresh_auto_instances(instance_dir: str | None = None) -> dict:
@@ -602,6 +1036,14 @@ def _refresh_auto_instances(instance_dir: str | None = None) -> dict:
     discovered = 0
     loaded = 0
     errors = []
+    skipped: list[dict[str, Any]] = []
+    pruned: list[str] = []
+    alive_count = 0
+    unreachable_count = 0
+    stale_count = 0
+    invalid_count = 0
+
+    parsed_entries: list[dict[str, Any]] = []
 
     if os.path.isdir(AUTO_INSTANCE_DIR):
         for path in sorted(glob.glob(os.path.join(AUTO_INSTANCE_DIR, "*.json"))):
@@ -614,57 +1056,156 @@ def _refresh_auto_instances(instance_dir: str | None = None) -> dict:
                 continue
 
             if not isinstance(payload, dict):
+                invalid_count += 1
                 errors.append({"file": path, "error": "Invalid payload type"})
                 continue
 
-            host = payload.get("host")
-            port = payload.get("port")
-            path_value = payload.get("path", "/mcp")
-            name = (
-                payload.get("name")
-                or payload.get("instance_id")
-                or payload.get("module")
-            )
-
-            if not isinstance(host, str):
-                errors.append({"file": path, "error": "Missing host"})
+            parsed, parse_error = _parse_registration_payload(path, payload)
+            if parsed is None:
+                invalid_count += 1
+                errors.append({"file": path, "error": parse_error or "Invalid payload"})
                 continue
-            host = _normalize_bound_host(host)
+            parsed_entries.append(parsed)
 
-            if isinstance(port, str):
+    probe_results: dict[str, tuple[str, str | None]] = {}
+
+    if parsed_entries:
+        max_workers = min(AUTO_PROBE_MAX_WORKERS, len(parsed_entries))
+        if max_workers <= 1:
+            for entry in parsed_entries:
+                source_file = str(entry.get("source_file"))
+                probe_results[source_file] = _auto_discovery_probe(entry)
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(_auto_discovery_probe, entry): str(
+                        entry.get("source_file")
+                    )
+                    for entry in parsed_entries
+                }
+                for future in as_completed(future_map):
+                    source_file = future_map[future]
+                    try:
+                        probe_results[source_file] = future.result()
+                    except Exception as e:
+                        probe_results[source_file] = ("unreachable", str(e))
+
+    status_rank = {"alive": 0, "unreachable": 1, "stale": 2, "invalid": 3}
+    deduped: dict[str, dict[str, Any]] = {}
+    for entry in parsed_entries:
+        source_file = str(entry.get("source_file"))
+        status, detail = probe_results.get(
+            source_file, ("invalid", "Missing probe result")
+        )
+        entry["auto_status"] = status
+        entry["auto_status_error"] = detail
+
+        dedupe_key = (
+            str(entry.get("registration_id") or "")
+            or str(entry.get("instance_id") or "")
+            or str(entry.get("name") or "")
+        )
+        previous = deduped.get(dedupe_key)
+        if previous is None:
+            deduped[dedupe_key] = entry
+            continue
+
+        previous_rank = status_rank.get(str(previous.get("auto_status")), 99)
+        current_rank = status_rank.get(status, 99)
+        previous_ts = float(previous.get("sort_timestamp", 0.0))
+        current_ts = float(entry.get("sort_timestamp", 0.0))
+
+        if (current_rank, -current_ts) < (previous_rank, -previous_ts):
+            kept, dropped = entry, previous
+            deduped[dedupe_key] = entry
+        else:
+            kept, dropped = previous, entry
+
+        skipped.append(
+            {
+                "file": dropped.get("source_file"),
+                "reason": "duplicate",
+                "registration_id": dedupe_key,
+                "kept": kept.get("source_file"),
+            }
+        )
+        if AUTO_PRUNE:
+            drop_file = dropped.get("source_file")
+            if isinstance(drop_file, str):
                 try:
-                    port = int(port, 0)
-                except Exception:
+                    os.remove(drop_file)
+                    pruned.append(drop_file)
+                except OSError:
                     pass
-            if not isinstance(port, int):
-                errors.append({"file": path, "error": "Missing/invalid port"})
-                continue
 
-            if not isinstance(path_value, str) or not path_value:
-                path_value = "/mcp"
+    selected_entries = list(deduped.values())
 
-            if not isinstance(name, str) or not name.strip():
-                name = f"ida_{port}"
-            name = name.strip()
+    for entry in selected_entries:
+        source_file = str(entry.get("source_file"))
+        status = str(entry.get("auto_status") or "invalid")
+        detail = entry.get("auto_status_error")
+        if not isinstance(detail, str):
+            detail = None
 
-            endpoint_url = f"http://{host}:{port}{path_value}"
-            try:
-                _register_ida_instance(
-                    name,
-                    endpoint_url,
-                    source="auto",
-                    extra={
-                        "source_file": path,
-                        "pid": payload.get("pid"),
-                        "module": payload.get("module"),
-                        "idb_path": payload.get("idb_path"),
-                        "instance_id": payload.get("instance_id"),
-                        "started_at": payload.get("started_at"),
-                    },
-                )
-                loaded += 1
-            except Exception as e:
-                errors.append({"file": path, "error": str(e)})
+        if status == "alive":
+            alive_count += 1
+        elif status == "unreachable":
+            unreachable_count += 1
+        elif status == "stale":
+            stale_count += 1
+            if AUTO_PRUNE:
+                try:
+                    os.remove(source_file)
+                    pruned.append(source_file)
+                except OSError:
+                    pass
+        else:
+            invalid_count += 1
+
+        should_route = status == "alive"
+        if status == "unreachable" and AUTO_INCLUDE_UNREACHABLE:
+            should_route = True
+        if (
+            AUTO_REQUIRE_LIVE
+            and status != "alive"
+            and not (status == "unreachable" and AUTO_INCLUDE_UNREACHABLE)
+        ):
+            should_route = False
+
+        if not should_route:
+            skipped.append(
+                {
+                    "file": source_file,
+                    "reason": status,
+                    "error": detail,
+                }
+            )
+            continue
+
+        endpoint_url = f"http://{entry['host']}:{entry['port']}{entry['path']}"
+        try:
+            _register_ida_instance(
+                str(entry["name"]),
+                endpoint_url,
+                source="auto",
+                extra={
+                    "source_file": source_file,
+                    "pid": entry.get("pid"),
+                    "pid_alive": entry.get("pid_alive"),
+                    "module": entry.get("module"),
+                    "idb_path": entry.get("idb_path"),
+                    "instance_id": entry.get("instance_id"),
+                    "registration_id": entry.get("registration_id"),
+                    "schema_version": entry.get("schema_version"),
+                    "started_at": entry.get("started_at"),
+                    "last_heartbeat_at": entry.get("last_heartbeat_at"),
+                    "heartbeat_interval_sec": entry.get("heartbeat_interval_sec"),
+                    "auto_status": status,
+                },
+            )
+            loaded += 1
+        except Exception as e:
+            errors.append({"file": source_file, "error": str(e)})
 
     with STATE_LOCK:
         has_previous = previous_active in IDA_INSTANCES
@@ -684,8 +1225,14 @@ def _refresh_auto_instances(instance_dir: str | None = None) -> dict:
         "instance_dir": AUTO_INSTANCE_DIR,
         "discovered_files": discovered,
         "loaded_instances": loaded,
+        "alive_count": alive_count,
+        "unreachable_count": unreachable_count,
+        "stale_count": stale_count,
+        "invalid_count": invalid_count,
+        "skipped": skipped,
         "current_instance": current_instance,
         "errors": errors,
+        **({"pruned": pruned} if pruned else {}),
     }
 
 
@@ -913,52 +1460,84 @@ def _extract_tools(response: JsonRpcResponse | None) -> list[dict]:
 def _read_instance_metadata(
     instance_name: str, *, timeout: float = 5
 ) -> tuple[dict | None, str | None]:
-    try:
-        response = _dispatch_to_ida(
-            {
-                "jsonrpc": "2.0",
-                "method": "resources/read",
-                "params": {"uri": "ida://idb/metadata"},
-                "id": 1,
-            },
-            instance_name=instance_name,
-            timeout=timeout,
-        )
-    except Exception as e:
-        return None, str(e)
+    last_error = "Unknown error"
+    for uri in ("ida://idb/metadata_fast", "ida://idb/metadata"):
+        try:
+            response = _dispatch_to_ida(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "resources/read",
+                    "params": {"uri": uri},
+                    "id": _next_internal_request_id(),
+                },
+                instance_name=instance_name,
+                timeout=timeout,
+            )
+        except Exception as e:
+            last_error = str(e)
+            continue
 
-    if response is None:
-        return None, "No response"
-    if "error" in response:
-        error = response["error"]
-        if isinstance(error, dict):
-            return None, str(error.get("message", "Unknown error"))
-        return None, "Unknown error"
+        if response is None:
+            last_error = "No response"
+            continue
+        if "error" in response:
+            error = response["error"]
+            if isinstance(error, dict):
+                last_error = str(error.get("message", "Unknown error"))
+            else:
+                last_error = "Unknown error"
+            continue
 
-    result = response.get("result")
-    if not isinstance(result, dict):
-        return None, "Invalid result payload"
+        result = response.get("result")
+        if not isinstance(result, dict):
+            last_error = "Invalid result payload"
+            continue
 
-    contents = result.get("contents")
-    if not isinstance(contents, list) or not contents:
-        return None, "Missing resource contents"
+        contents = result.get("contents")
+        if not isinstance(contents, list) or not contents:
+            last_error = "Missing resource contents"
+            continue
 
-    first = contents[0]
-    if not isinstance(first, dict):
-        return None, "Invalid resource content"
+        first = contents[0]
+        if not isinstance(first, dict):
+            last_error = "Invalid resource content"
+            continue
 
-    text = first.get("text")
-    if not isinstance(text, str):
-        return None, "Metadata response missing text payload"
+        text = first.get("text")
+        if not isinstance(text, str):
+            last_error = "Metadata response missing text payload"
+            continue
 
-    try:
-        metadata = json.loads(text)
-    except json.JSONDecodeError as e:
-        return None, f"Metadata parse failed: {e}"
+        try:
+            metadata = json.loads(text)
+        except json.JSONDecodeError as e:
+            last_error = f"Metadata parse failed: {e}"
+            continue
 
-    if not isinstance(metadata, dict):
-        return None, "Metadata payload is not an object"
-    return metadata, None
+        if not isinstance(metadata, dict):
+            last_error = "Metadata payload is not an object"
+            continue
+        return metadata, None
+    return None, last_error
+
+
+def _read_instance_metadata_cached(
+    instance_name: str,
+    *,
+    timeout: float | int | None = None,
+    use_cache: bool = True,
+) -> tuple[dict | None, str | None]:
+    if use_cache:
+        cached = _metadata_cache_get(instance_name)
+        if cached is not None:
+            return cached, None
+
+    metadata, error = _read_instance_metadata(
+        instance_name, timeout=_metadata_timeout_budget(timeout)
+    )
+    if metadata is not None:
+        _metadata_cache_put(instance_name, metadata)
+    return metadata, error
 
 
 def _ping_instance(instance_name: str, *, timeout: float = 5) -> str | None:
@@ -967,7 +1546,7 @@ def _ping_instance(instance_name: str, *, timeout: float = 5) -> str | None:
             {
                 "jsonrpc": "2.0",
                 "method": "ping",
-                "id": 1,
+                "id": _next_internal_request_id(),
             },
             instance_name=instance_name,
             timeout=timeout,
@@ -1106,7 +1685,7 @@ def _remote_tool_call(
             "name": tool_name,
             "arguments": arguments,
         },
-        "id": 1,
+        "id": _next_internal_request_id(),
     }
 
     try:
@@ -1231,19 +1810,20 @@ def list_instances(
     if probe_timeout > 30:
         probe_timeout = 30
 
-    for name, endpoint in instance_pairs:
+    def build_entry(name: str, endpoint: dict[str, Any]) -> dict[str, Any]:
         error = None
         metadata = None
+        metadata_error = None
         if probe:
             error = _ping_instance(name, timeout=probe_timeout)
             if error is None and include_metadata:
-                metadata, metadata_error = _read_instance_metadata(
-                    name, timeout=probe_timeout
+                metadata, metadata_error = _read_instance_metadata_cached(
+                    name,
+                    timeout=probe_timeout,
+                    use_cache=True,
                 )
-                if metadata is None:
-                    error = metadata_error
 
-        entry = {
+        entry: dict[str, Any] = {
             "name": name,
             "active": name == current,
             "url": str(endpoint["url"]),
@@ -1269,12 +1849,37 @@ def list_instances(
                 entry["module"] = metadata.get("module")
                 entry["input_path"] = metadata.get("path")
                 entry["base"] = metadata.get("base")
+            elif metadata_error is not None:
+                entry["metadata_error"] = metadata_error
         elif probe:
             entry["status"] = "unreachable"
             entry["error"] = error
         else:
             entry["status"] = "registered"
-        instances.append(entry)
+        return entry
+
+    if probe and LIST_PARALLEL_PROBE and len(instance_pairs) > 1:
+        max_workers = min(LIST_PROBE_MAX_WORKERS, len(instance_pairs))
+        results: list[dict[str, Any] | None] = [None] * len(instance_pairs)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(build_entry, name, endpoint): idx
+                for idx, (name, endpoint) in enumerate(instance_pairs)
+            }
+            for future in as_completed(future_map):
+                idx = future_map[future]
+                try:
+                    results[idx] = future.result()
+                except Exception as e:
+                    name, endpoint = instance_pairs[idx]
+                    failed = build_entry(name, endpoint)
+                    failed["status"] = "unreachable"
+                    failed["error"] = str(e)
+                    results[idx] = failed
+        instances = [entry for entry in results if isinstance(entry, dict)]
+    else:
+        for name, endpoint in instance_pairs:
+            instances.append(build_entry(name, endpoint))
 
     return {
         "current_instance": current,
@@ -1283,22 +1888,34 @@ def list_instances(
 
 
 @mcp.tool
-def current_instance() -> dict:
+def current_instance(_meta: dict | None = None) -> dict:
     """Show the currently selected IDA instance and metadata if reachable."""
+    session_key = _extract_session_key_from_meta(_meta)
+    if session_key is None:
+        session_key = _get_request_session_key()
+
     with STATE_LOCK:
-        current = IDA_CURRENT_INSTANCE
+        global_current = IDA_CURRENT_INSTANCE
+    current = _effective_instance_name(session_key)
+
+    with STATE_LOCK:
         endpoint = IDA_INSTANCES.get(current)
         endpoint_snapshot = dict(endpoint) if endpoint is not None else None
 
     endpoint = endpoint_snapshot
     if endpoint is None:
-        return {
+        response = {
             "current_instance": current,
             "status": "invalid",
             "error": "Current instance is not configured",
         }
+        if SESSION_ROUTING_ENABLED and session_key is not None:
+            response["session_key"] = session_key
+            response["global_instance"] = global_current
+            response["scope"] = "session"
+        return response
 
-    metadata, error = _read_instance_metadata(current)
+    metadata, error = _read_instance_metadata_cached(current, use_cache=True)
     response = {
         "current_instance": current,
         "url": str(endpoint["url"]),
@@ -1313,12 +1930,21 @@ def current_instance() -> dict:
     else:
         response["status"] = "unreachable"
         response["error"] = error
+
+    if SESSION_ROUTING_ENABLED and session_key is not None:
+        response["session_key"] = session_key
+        response["global_instance"] = global_current
+        response["scope"] = "session"
     return response
 
 
 @mcp.tool
-def use_instance(name: str) -> dict:
+def use_instance(name: str, _meta: dict | None = None) -> dict:
     """Switch active IDA instance by configured instance name."""
+    session_key = _extract_session_key_from_meta(_meta)
+    if session_key is None:
+        session_key = _get_request_session_key()
+
     with STATE_LOCK:
         exists = name in IDA_INSTANCES
         available_instances = sorted(IDA_INSTANCES.keys())
@@ -1330,12 +1956,19 @@ def use_instance(name: str) -> dict:
             "available_instances": available_instances,
         }
 
-    with STATE_LOCK:
-        previous = IDA_CURRENT_INSTANCE
-    _set_active_instance(name)
+    previous = _effective_instance_name(session_key)
+    bound_to_session = False
+    if SESSION_ROUTING_ENABLED and session_key is not None:
+        bound_to_session = _bind_session_instance(session_key, name)
+
+    if not bound_to_session:
+        _set_active_instance(name)
+
     with STATE_LOCK:
         endpoint = dict(IDA_INSTANCES[name])
-    metadata, error = _read_instance_metadata(name)
+        global_current = IDA_CURRENT_INSTANCE
+
+    metadata, error = _read_instance_metadata_cached(name, use_cache=True)
 
     response = {
         "success": True,
@@ -1350,6 +1983,11 @@ def use_instance(name: str) -> dict:
     else:
         response["status"] = "unreachable"
         response["warning"] = error
+
+    if SESSION_ROUTING_ENABLED and session_key is not None:
+        response["session_key"] = session_key
+        response["global_instance"] = global_current
+        response["scope"] = "session" if bound_to_session else "global"
     return response
 
 
@@ -1690,6 +2328,7 @@ def trace_export(path: str | None = None, clear_after_export: bool = False) -> d
 def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse | None:
     """Dispatch JSON-RPC requests to the MCP server registry"""
     request_obj = _parse_request_obj(request)
+    session_key = _extract_session_key(request_obj)
 
     if request_obj["method"] == "initialize":
         response = dispatch_original(dict(request_obj))
@@ -1778,7 +2417,11 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
         if isinstance(params, dict):
             name = params.get("name")
             if isinstance(name, str) and name in LOCAL_TOOL_NAMES:
-                response = dispatch_original(dict(request_obj))
+                _set_request_session_key(session_key)
+                try:
+                    response = dispatch_original(dict(request_obj))
+                finally:
+                    _set_request_session_key(None)
                 _trace_record(
                     request_obj, response, route="local", instance_name="local"
                 )
@@ -1798,8 +2441,7 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
                     forward_request_obj["params"] = sanitized_params
 
     if target_instance is None:
-        with STATE_LOCK:
-            target_instance = IDA_CURRENT_INSTANCE
+        target_instance = _effective_instance_name(session_key)
 
     queue_timeout, request_timeout = _timeouts_for_request(forward_request_obj)
 
@@ -1867,7 +2509,14 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
                 target_instance = retry_instance
                 if route == "remote_after_failover":
                     try:
-                        _set_active_instance(retry_instance)
+                        if (
+                            SESSION_ROUTING_ENABLED
+                            and isinstance(session_key, str)
+                            and session_key
+                        ):
+                            _bind_session_instance(session_key, retry_instance)
+                        else:
+                            _set_active_instance(retry_instance)
                     except Exception:
                         pass
                 _trace_record(

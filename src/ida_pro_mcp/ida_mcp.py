@@ -7,7 +7,9 @@ It loads the actual implementation from the ida_mcp package.
 import json
 import os
 import sys
+import threading
 import time
+import uuid
 import idaapi
 import ida_kernwin
 import ida_nalt
@@ -85,6 +87,7 @@ class MCP(idaapi.plugin_t):
 
     DEFAULT_HOST = "127.0.0.1"
     DEFAULT_PORT = 0
+    DEFAULT_HEARTBEAT_INTERVAL_SEC = 15.0
 
     @staticmethod
     def _appdata_root() -> str:
@@ -162,7 +165,31 @@ class MCP(idaapi.plugin_t):
         host = self._normalize_bound_host(host)
         return host, port
 
-    def _write_instance_registration(self, host: str, port: int):
+    def _heartbeat_interval_sec(self) -> float:
+        raw = os.environ.get("IDA_MCP_HEARTBEAT_INTERVAL_SECONDS")
+        if raw is None:
+            return self.DEFAULT_HEARTBEAT_INTERVAL_SEC
+        try:
+            value = float(raw)
+        except ValueError:
+            return self.DEFAULT_HEARTBEAT_INTERVAL_SEC
+        if value <= 0:
+            return self.DEFAULT_HEARTBEAT_INTERVAL_SEC
+        return value
+
+    def _build_registration_payload(self, host: str, port: int) -> dict:
+        instance_id = getattr(self, "instance_id", "")
+        if not isinstance(instance_id, str) or not instance_id:
+            instance_id = uuid.uuid4().hex
+            self.instance_id = instance_id
+        instance_started_at = getattr(self, "instance_started_at", 0.0)
+        if (
+            not isinstance(instance_started_at, (int, float))
+            or instance_started_at <= 0
+        ):
+            instance_started_at = time.time()
+            self.instance_started_at = instance_started_at
+
         module = ida_nalt.get_root_filename() or "unknown"
         try:
             idb_path = idc.get_idb_path()
@@ -174,7 +201,12 @@ class MCP(idaapi.plugin_t):
         except Exception:
             input_path = ""
 
-        payload = {
+        heartbeat_interval_sec = self._heartbeat_interval_sec()
+        now = time.time()
+        return {
+            "schema_version": 2,
+            "instance_id": instance_id,
+            "registration_id": instance_id,
             "name": f"{module}-{os.getpid()}",
             "pid": os.getpid(),
             "host": host,
@@ -184,17 +216,60 @@ class MCP(idaapi.plugin_t):
             "idb_path": idb_path,
             "input_path": input_path,
             "imagebase": hex(idaapi.get_imagebase()),
-            "started_at": time.time(),
+            "started_at": float(instance_started_at),
+            "last_heartbeat_at": now,
+            "heartbeat_interval_sec": heartbeat_interval_sec,
         }
 
+    def _write_registration_payload(self, payload: dict):
         os.makedirs(self._instance_dir(), exist_ok=True)
         instance_path = self._instance_file_path()
         tmp_path = instance_path + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
         os.replace(tmp_path, instance_path)
-
         self.instance_registration_path = instance_path
+
+    def _write_instance_registration(self, host: str, port: int):
+        payload = self._build_registration_payload(host, port)
+        self._registration_payload = payload
+        self._write_registration_payload(payload)
+
+    def _registration_heartbeat_loop(self):
+        stop_event = self._heartbeat_stop_event
+        if not isinstance(stop_event, threading.Event):
+            return
+        while not stop_event.wait(self._heartbeat_interval_sec()):
+            payload = self._registration_payload
+            if not isinstance(payload, dict):
+                continue
+            try:
+                updated_payload = dict(payload)
+                updated_payload["last_heartbeat_at"] = time.time()
+                self._write_registration_payload(updated_payload)
+                self._registration_payload = updated_payload
+            except Exception as e:
+                print(f"[MCP] Failed to write heartbeat: {e}")
+
+    def _start_registration_heartbeat(self):
+        self._stop_registration_heartbeat()
+        self._heartbeat_stop_event = threading.Event()
+        self._heartbeat_thread = threading.Thread(
+            target=self._registration_heartbeat_loop,
+            name="ida-mcp-heartbeat",
+            daemon=True,
+        )
+        self._heartbeat_thread.start()
+
+    def _stop_registration_heartbeat(self):
+        stop_event = self._heartbeat_stop_event
+        heartbeat_thread = self._heartbeat_thread
+        if isinstance(stop_event, threading.Event):
+            stop_event.set()
+        if isinstance(heartbeat_thread, threading.Thread):
+            heartbeat_thread.join(timeout=2.0)
+        self._heartbeat_stop_event = None
+        self._heartbeat_thread = None
 
     def _clear_instance_registration(self):
         instance_path = self.instance_registration_path or self._instance_file_path()
@@ -205,7 +280,9 @@ class MCP(idaapi.plugin_t):
             print(f"[MCP] Failed to remove instance registration: {e}")
 
     def _stop_server(self):
+        self._stop_registration_heartbeat()
         self._clear_instance_registration()
+        self._registration_payload = None
         if self.mcp:
             self.mcp.stop()
             self.mcp = None
@@ -220,6 +297,11 @@ class MCP(idaapi.plugin_t):
         )
         self.mcp: "ida_mcp.rpc.McpServer | None" = None
         self.instance_registration_path: str | None = None
+        self.instance_id = uuid.uuid4().hex
+        self.instance_started_at = time.time()
+        self._registration_payload: dict | None = None
+        self._heartbeat_stop_event: threading.Event | None = None
+        self._heartbeat_thread: threading.Thread | None = None
         self.host = self.DEFAULT_HOST
         self.port = self.DEFAULT_PORT
         self._load_config()
@@ -261,6 +343,7 @@ class MCP(idaapi.plugin_t):
             actual_host, actual_port = self._resolve_bound_endpoint(MCP_SERVER)
             print(f"  Config: http://{actual_host}:{actual_port}/config.html")
             self._write_instance_registration(actual_host, actual_port)
+            self._start_registration_heartbeat()
             self.mcp = MCP_SERVER
         except OSError as e:
             if e.errno in (48, 98, 10048):  # Address already in use

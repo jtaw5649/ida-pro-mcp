@@ -85,6 +85,55 @@ class _McpSseConnection:
             return False
 
 
+def _merge_request_meta(request_obj: Any, extra_meta: dict[str, str] | None) -> Any:
+    if (
+        not isinstance(request_obj, dict)
+        or not isinstance(extra_meta, dict)
+        or not extra_meta
+    ):
+        return request_obj
+
+    params = request_obj.get("params")
+    if params is None:
+        merged_meta = dict(extra_meta)
+        merged_request = dict(request_obj)
+        merged_request["params"] = {"_meta": merged_meta}
+        return merged_request
+
+    if not isinstance(params, dict):
+        return request_obj
+
+    existing_meta = params.get("_meta")
+    merged_meta: dict[str, Any] = {}
+    if isinstance(existing_meta, dict):
+        merged_meta.update(existing_meta)
+    for key, value in extra_meta.items():
+        if key not in merged_meta:
+            merged_meta[key] = value
+
+    merged_params = dict(params)
+    merged_params["_meta"] = merged_meta
+    merged_request = dict(request_obj)
+    merged_request["params"] = merged_params
+    return merged_request
+
+
+def _inject_request_meta(body: bytes, extra_meta: dict[str, str] | None) -> bytes:
+    if not extra_meta:
+        return body
+
+    try:
+        request_obj = json.loads(body)
+    except Exception:
+        return body
+
+    merged = _merge_request_meta(request_obj, extra_meta)
+    if merged is request_obj:
+        return body
+
+    return json.dumps(merged).encode("utf-8")
+
+
 class McpHttpRequestHandler(BaseHTTPRequestHandler):
     server_version = "zeromcp/1.3.0"
     error_message_format = "%(code)d - %(message)s"
@@ -224,6 +273,8 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             self.send_error(400, "Missing ?session for SSE POST")
             return
 
+        body = _inject_request_meta(body, {"sseSessionId": session_id})
+
         # Parse extensions from query params and store in thread-local
         extensions = self._parse_extensions(self.path)
         setattr(self.mcp_server._enabled_extensions, "data", extensions)
@@ -254,6 +305,10 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _handle_mcp_post(self, body: bytes):
+        session_id = self.headers.get("Mcp-Session-Id")
+        if isinstance(session_id, str) and session_id.strip():
+            body = _inject_request_meta(body, {"mcpSessionId": session_id.strip()})
+
         # Parse extensions from query params and store in thread-local
         extensions = self._parse_extensions(self.path)
         setattr(self.mcp_server._enabled_extensions, "data", extensions)

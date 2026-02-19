@@ -198,6 +198,12 @@ To avoid cross-agent `use_instance` races in shared sessions, you can pin a sing
 }
 ```
 
+Session-aware routing notes:
+
+- stdio is a single logical client stream, so there is no per-client session metadata to isolate routing.
+- Session routing benefits apply to HTTP/SSE clients that send session metadata (`Mcp-Session-Id` for `/mcp`, `?session=` for `/sse`).
+- `_instance` remains the highest-precedence routing override for a specific call.
+
 You can also enable automatic instance discovery via plugin registration files:
 
 ```sh

@@ -67,6 +67,27 @@ def idb_metadata_resource() -> Metadata:
     )
 
 
+@resource("ida://idb/metadata_fast")
+@idasync
+def idb_metadata_fast_resource() -> Metadata:
+    """Get lightweight IDB metadata without expensive hash computation"""
+    path = idc.get_idb_path()
+    module = ida_nalt.get_root_filename()
+    base = hex(idaapi.get_imagebase())
+    size = hex(get_image_size())
+
+    return Metadata(
+        path=path,
+        module=module,
+        base=base,
+        size=size,
+        md5="unavailable",
+        sha256="unavailable",
+        crc32="unavailable",
+        filesize="unavailable",
+    )
+
+
 @resource("ida://idb/segments")
 @idasync
 def idb_segments_resource() -> list[Segment]:
